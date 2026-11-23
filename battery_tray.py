@@ -174,6 +174,7 @@ class HidDevice:
         if h is None or h == INVALID:
             raise OSError("không mở được thiết bị HID")
         self.h = h
+        self.path = info["path"]
         self.in_len = info["in_len"] or 20
         self.out_len = info["out_len"] or 20
         self.event = k32.CreateEventW(None, True, False, None)
@@ -257,23 +258,45 @@ def hidpp_request(dev, idx, feat_idx, func, params=b"", timeout=1500):
             return None
         if len(r) < 7 or r[0] not in (0x10, 0x11) or r[1] != idx:
             continue
-        if r[2] in (0x8F, 0xFF):          # báo lỗi (thiết bị ngủ / không tồn tại / không hỗ trợ)
-            dbg(f"   idx={idx} lỗi HID++: {r[:7].hex()}")
-            return None
-        if r[2] == feat_idx and r[3] == ((func << 4) | SW_ID):
+        want = (func << 4) | SW_ID
+        if r[2] in (0x8F, 0xFF):          # báo lỗi - chỉ tính nếu là trả lời lệnh của MÌNH
+            if r[3] == feat_idx and r[4] == want:
+                dbg(f"   idx={idx} lỗi HID++: {r[:7].hex()}")
+                return None
+            continue                      # lỗi của ứng dụng khác (vd G HUB) -> bỏ qua
+        if r[2] == feat_idx and r[3] == want:
             return r[4:]
 
 
+def hidpp_retry(dev, idx, feat_idx, func, params=b"", tries=3, timeout=1200):
+    """Chuột Lightspeed có thể đang ngủ nên thử lại vài lần trước khi bỏ cuộc."""
+    for _ in range(tries):
+        r = hidpp_request(dev, idx, feat_idx, func, params, timeout)
+        if r is not None:
+            return r
+        time.sleep(0.25)
+    return None
+
+
+_feat_cache = {}
+
+
 def feature_index(dev, idx, feature_id):
-    r = hidpp_request(dev, idx, 0x00, 0, bytes([feature_id >> 8, feature_id & 0xFF]))
-    return r[0] if r and r[0] != 0 else None
+    key = (dev.path, idx, feature_id)
+    if key in _feat_cache:
+        return _feat_cache[key]
+    r = hidpp_retry(dev, idx, 0x00, 0, bytes([feature_id >> 8, feature_id & 0xFF]))
+    fi = r[0] if r and r[0] != 0 else None
+    if r is not None:                      # chỉ nhớ khi thiết bị thật sự đã trả lời
+        _feat_cache[key] = fi
+    return fi
 
 
 def read_logitech_battery(dev, idx):
     """Thử lần lượt các feature pin của HID++: 0x1004, 0x1000, 0x1001."""
     fi = feature_index(dev, idx, 0x1004)            # Unified Battery
     if fi:
-        r = hidpp_request(dev, idx, fi, 1)
+        r = hidpp_retry(dev, idx, fi, 1)
         if r:
             soc, flags, status = r[0], r[1], r[2]
             if soc == 0 and flags:                  # chỉ có mức thô
@@ -281,12 +304,12 @@ def read_logitech_battery(dev, idx):
             return {"level": soc, "charging": status in (1, 2)}
     fi = feature_index(dev, idx, 0x1000)            # Battery Level Status
     if fi:
-        r = hidpp_request(dev, idx, fi, 0)
+        r = hidpp_retry(dev, idx, fi, 0)
         if r:
             return {"level": r[0], "charging": r[2] in (1, 2, 4)}
     fi = feature_index(dev, idx, 0x1001)            # Battery Voltage
     if fi:
-        r = hidpp_request(dev, idx, fi, 0)
+        r = hidpp_retry(dev, idx, fi, 0)
         if r:
             mv = (r[0] << 8) | r[1]
             return {"level": volt_to_pct(mv), "charging": bool(r[2] & 0x80)}
@@ -351,7 +374,10 @@ def read_logitech():
                 for idx in (1, 2, 3, 4, 5, 6, 0xFF, 0):
                     if found and idx in (0xFF, 0):
                         break
-                    if hidpp_request(dev, idx, 0x00, 1, bytes([0, 0, 0x55]), timeout=500) is None:
+                    known = (info["path"], idx) in _name_cache
+                    tries = 3 if idx == 1 else 1
+                    if not known and hidpp_retry(dev, idx, 0x00, 1, bytes([0, 0, 0x55]),
+                                                 tries=tries, timeout=800) is None:
                         continue
                     bat = read_logitech_battery(dev, idx)
                     dbg(f"   idx={idx} pin: {bat}")
@@ -529,6 +555,7 @@ APP_NAME = "BatteryTray"
 AUTO = "auto"
 AUTO_LABEL = "Tự động (thiết bị yếu nhất)"
 INTERVALS = {"30 giây": 30, "1 phút": 60, "2 phút": 120, "5 phút": 300}
+STALE_SECONDS = 1800   # giữ giá trị cũ tối đa 30 phút nếu lần đọc mới không thấy thiết bị
 
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -795,6 +822,8 @@ class App:
                 parts.append("Pin tốt")
             if dv.get("src"):
                 parts.append(dv["src"])
+            if dv.get("stale"):
+                parts.append("giá trị cũ lúc " + time.strftime("%H:%M", time.localtime(dv["ts"])))
             if selected:
                 parts.append("Đang hiện trên taskbar")
             tk.Label(inner, text="  •  ".join(parts), bg=CARD, fg=MUTED, font=("Segoe UI", 9),
@@ -865,11 +894,22 @@ class App:
         self.icon.update_menu()
 
     def on_data(self, devices):
-        self.devices = devices
-        self.status.config(text="Cập nhật lúc " + time.strftime("%H:%M:%S"))
+        now = time.time()
+        merged = {n: dict(d, ts=now, stale=False) for n, d in devices.items()}
+        for n, d in self.devices.items():          # lần đọc trượt -> giữ giá trị cũ
+            if n not in merged and now - d.get("ts", 0) < STALE_SECONDS:
+                merged[n] = dict(d, stale=True)
+        self.devices = merged
+        missing = sum(1 for d in merged.values() if d["stale"])
+        txt = "Cập nhật lúc " + time.strftime("%H:%M:%S")
+        if missing:
+            txt += f"  •  {missing} thiết bị chưa đọc được lần này (đang hiện giá trị cũ)"
+        self.status.config(text=txt)
         self.refresh_view()
         low = int(self.cfg["low"])
-        for name, d in devices.items():
+        for name, d in merged.items():
+            if d["stale"]:
+                continue
             lvl = d["level"]
             if lvl <= low and not d.get("charging") and name not in self.warned:
                 self.warned.add(name)
@@ -933,5 +973,25 @@ class App:
         self.root.mainloop()
 
 
+_mutex = None
+
+
+def already_running():
+    global _mutex
+    if sys.platform != "win32":
+        return False
+    k32.CreateMutexW.argtypes = [VP, wt.BOOL, wt.LPCWSTR]
+    k32.CreateMutexW.restype = VP
+    _mutex = k32.CreateMutexW(None, False, "Local\\BatteryTray_SingleInstance")
+    return ctypes.get_last_error() == 183          # ERROR_ALREADY_EXISTS
+
+
 if __name__ == "__main__":
+    if already_running():
+        from tkinter import messagebox
+        _r = tk.Tk()
+        _r.withdraw()
+        messagebox.showinfo("BatteryTray", "Ứng dụng đã đang chạy rồi.\n"
+                            "Hãy tìm icon ở khay hệ thống (mũi tên ^ cạnh đồng hồ).")
+        sys.exit(0)
     App().run()
