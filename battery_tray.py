@@ -555,7 +555,7 @@ APP_NAME = "BatteryTray"
 AUTO = "auto"
 AUTO_LABEL = "Tự động (thiết bị yếu nhất)"
 INTERVALS = {"30 giây": 30, "1 phút": 60, "2 phút": 120, "5 phút": 300}
-STALE_SECONDS = 1800   # giữ giá trị cũ tối đa 30 phút nếu lần đọc mới không thấy thiết bị
+STALE_SECONDS = 12 * 3600   # giữ giá trị cũ tối đa 12 giờ nếu lần đọc mới không thấy thiết bị
 
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -660,6 +660,12 @@ class App:
     def __init__(self):
         self.cfg = load_config()
         self.devices = {}
+        for n, d in (self.cfg.get("last") or {}).items():      # giá trị lần chạy trước
+            try:
+                if time.time() - d["ts"] < STALE_SECONDS:
+                    self.devices[n] = dict(d, stale=True)
+            except Exception:
+                pass
         self.warned = set()
         self.first_hide = True
         self.q = queue.Queue()
@@ -685,6 +691,8 @@ class App:
         self.icon = pystray.Icon(APP_NAME, make_icon(None), "Đang đọc pin...",
                                  menu=pystray.Menu(self.tray_menu))
         self.icon.run_detached()
+        if self.devices:
+            self.root.after(1500, self.refresh_view)
 
         threading.Thread(target=self.loop, daemon=True).start()
         self.root.after(200, self.pump)
@@ -823,7 +831,10 @@ class App:
             if dv.get("src"):
                 parts.append(dv["src"])
             if dv.get("stale"):
-                parts.append("giá trị cũ lúc " + time.strftime("%H:%M", time.localtime(dv["ts"])))
+                note = "giá trị cũ lúc " + time.strftime("%H:%M", time.localtime(dv["ts"]))
+                if str(dv.get("src", "")).startswith("Logitech"):
+                    note += " - chuột đang ngủ, hãy di chuột"
+                parts.append(note)
             if selected:
                 parts.append("Đang hiện trên taskbar")
             tk.Label(inner, text="  •  ".join(parts), bg=CARD, fg=MUTED, font=("Segoe UI", 9),
@@ -900,6 +911,9 @@ class App:
             if n not in merged and now - d.get("ts", 0) < STALE_SECONDS:
                 merged[n] = dict(d, stale=True)
         self.devices = merged
+        self.cfg["last"] = {n: {"level": d["level"], "charging": d.get("charging"),
+                                "src": d.get("src"), "ts": d["ts"]} for n, d in merged.items()}
+        save_config(self.cfg)
         missing = sum(1 for d in merged.values() if d["stale"])
         txt = "Cập nhật lúc " + time.strftime("%H:%M:%S")
         if missing:
@@ -918,11 +932,23 @@ class App:
                 self.warned.discard(name)
 
     def loop(self):
+        """Luồng nền. Bluetooth (PowerShell, chậm) quét theo chu kỳ cài đặt; Logitech (nhanh) mỗi
+        vòng. Khi chuột Logitech đang ngủ thì quét lại mỗi 15 giây để bắt kịp lúc bạn di chuột."""
+        bt, last_bt, known_lg = {}, 0.0, set()
         while not self.stop.is_set():
-            data = read_all()
-            self.q.put(lambda d=data: self.on_data(d))
-            self.wake.wait(int(self.cfg["interval"]))
+            forced = self.wake.is_set()
             self.wake.clear()
+            interval = int(self.cfg["interval"])
+            if forced or time.monotonic() - last_bt >= interval:
+                bt = read_bluetooth()
+                last_bt = time.monotonic()
+            lg = read_logitech()
+            known_lg |= set(lg)
+            asleep = bool(known_lg - set(lg))
+            data = dict(bt)
+            data.update(lg)
+            self.q.put(lambda d=data: self.on_data(d))
+            self.wake.wait(min(interval, 15) if asleep else interval)
 
     def pump(self):
         try:
